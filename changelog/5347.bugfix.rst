@@ -1,0 +1,6 @@
+Discarded a pooled connection when a response's message boundary could not be
+confirmed, instead of returning it while unconsumed framing bytes remained. A
+failed content-decoding step (for example a corrupted gzip trailer) no longer
+leaves the underlying connection reusable, so the next request can never read
+the tail of the previous response. Fully consumed responses continue to be
+reused as before.

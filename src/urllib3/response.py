@@ -516,6 +516,9 @@ class BaseHTTPResponse(io.IOBase):
         self.reason = reason
         self.decode_content = decode_content
         self._has_decoded_content = False
+        # Sticky marker that content decoding failed. Subclasses use it to
+        # decide whether the underlying connection can safely be reused.
+        self._decode_failed = False
         self._request_url: str | None = request_url
         self.retries = retries
 
@@ -679,17 +682,29 @@ class BaseHTTPResponse(io.IOBase):
             if self._decoder:
                 data = self._decoder.decompress(data, max_length=max_length)
                 self._has_decoded_content = True
+            if flush_decoder:
+                data += self._flush_decoder()
         except self.DECODER_ERROR_CLASSES as e:
+            # The encoded message boundary was never confirmed. Mark the failure
+            # and let the subclass discard any connection that may already have
+            # been returned to the pool before the decoder flush failed.
+            self._decode_failed = True
+            self._on_decode_failure()
             content_encoding = self.headers.get("content-encoding", "").lower()
             raise DecodeError(
                 "Received response with content-encoding: %s, but "
                 "failed to decode it." % content_encoding,
                 e,
             ) from e
-        if flush_decoder:
-            data += self._flush_decoder()
 
         return data
+
+    def _on_decode_failure(self) -> None:
+        """Hook invoked once after a content decoder raises.
+
+        Subclasses that own a pooled connection override this to make sure the
+        connection carrying the unconfirmed response is not handed out again.
+        """
 
     def _flush_decoder(self) -> bytes:
         """
@@ -794,6 +809,10 @@ class HTTPResponse(BaseHTTPResponse):
 
         self._body = None
         self._uncached_read_occurred = False
+        # Reference retained after auto-release so a subsequent decode failure
+        # can close a connection that has already been handed back to the pool
+        # (the last raw read returns it before the decoder flush runs).
+        self._pooled_connection: HTTPConnection | None = None
         self._fp: _HttplibHTTPResponse | None = None
         self._original_response = original_response
         self._fp_bytes_read = 0
@@ -822,11 +841,98 @@ class HTTPResponse(BaseHTTPResponse):
         if preload_content and not self._body:
             self._body = self.read(decode_content=decode_content)
 
+    def _on_decode_failure(self) -> None:
+        # The framing file is typically already closed by the raw read that
+        # supplied the bad bytes, and that read's error catcher may have pooled
+        # the connection before the decoder flush fails. Close whichever
+        # references we still hold so it cannot be reused with leftover bytes.
+        if self._connection:
+            self._connection.close()
+        if self._pooled_connection is not None:
+            self._pooled_connection.close()
+            self._pooled_connection = None
+
+    def _has_pending_framing(self) -> bool:
+        """
+        Whether the response's message boundary has not been confirmed.
+
+        A connection is only safe to reuse once the entire framed response has
+        been consumed: a ``Content-Length`` body must reach zero bytes
+        remaining, a chunked body must reach its terminating chunk, and a
+        compressed body must be read through its decoder to end of stream.
+
+        The ``closed``/``isclosed()`` state of the underlying file is not by
+        itself sufficient evidence: a failed read closes the file even when
+        framing bytes (for example, the start of the next response) are still
+        buffered. It is used only as a fast path for responses whose explicit
+        framing counters prove completion. When in doubt, report pending
+        framing so the connection is discarded rather than handed back
+        carrying another response's bytes.
+        """
+        if self._fp is None:
+            return False
+
+        # A sticky decompression failure means the encoded boundary was never
+        # confirmed, regardless of the decoder's current point-in-time state.
+        if self._decode_failed:
+            return True
+
+        # http.client sets its inner file to ``None`` once the whole framed
+        # body has been read and the response closed. This is the authoritative
+        # "boundary confirmed" signal at the framing level, and it is already
+        # in place during the auto-release at end of body, before urllib3 has
+        # updated its own ``length_remaining`` counter.
+        inner_fp = getattr(self._fp, "fp", None)
+        framing_exhausted = inner_fp is None and self.isclosed()
+
+        if framing_exhausted:
+            return False
+
+        # Explicit framing counters remain authoritative for seekable and
+        # partially-read responses that have not closed the underlying file.
+        if self.length_remaining is not None and self.length_remaining > 0:
+            return True
+
+        if self.chunked and self.chunk_left:
+            return True
+
+        if self.isclosed():
+            return False
+
+        # Fall back to inspecting seekable in-memory bodies (used in tests and
+        # some adapters). Real socket-backed readers are not seekable and rely
+        # on the explicit framing signals above.
+        target = inner_fp if inner_fp is not None else self._fp
+        try:
+            if target.seekable():
+                return target.seek(0, io.SEEK_END) - target.tell() > 0
+        except (OSError, ValueError, AttributeError):
+            pass
+
+        return True
+
     def release_conn(self) -> None:
         if not self._pool or not self._connection:
             return None
 
-        self._pool._put_conn(self._connection)
+        connection = self._connection
+        # Never return a connection whose response boundary is unconfirmed:
+        # unconsumed framing bytes would leak into the next request on reuse.
+        # Discarding is always permitted; silently reusing a dirty connection
+        # is not.
+        if self._has_pending_framing():
+            connection.close()
+
+        # Keep a back-reference before detaching. A content decoder may still
+        # have to flush after the framing file is exhausted (and fail on a
+        # corrupted trailer); _decode() uses this to close a connection that
+        # has already been pooled rather than leave it reusable with leftover
+        # response bytes.
+        self._pooled_connection = connection
+        self._pool._put_conn(connection)
+        # Drop the reference first so a second release_conn() (for example an
+        # explicit call after the auto-release done at end of body) cannot
+        # close the same connection again once it may already be pooled.
         self._connection = None
 
     def drain_conn(self) -> None:
