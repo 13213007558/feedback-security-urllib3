@@ -1,0 +1,9 @@
+Added an optional ``deadline`` parameter to :class:`urllib3.util.Retry` that
+sets a total, monotonic time budget shared by every attempt of a single call,
+including connection attempts, ``Retry-After``/backoff waits and redirects.
+The remaining budget is checked before each wait and send and combined with
+the per-attempt connect/read timeouts (taking the shorter value, never
+relaxing them). Exhausting the budget raises
+:class:`urllib3.exceptions.DeadlineExceededError`, a ``MaxRetryError``
+subclass carrying the last failure and the full retry history. The default
+(``deadline=None``) preserves the previous behavior.

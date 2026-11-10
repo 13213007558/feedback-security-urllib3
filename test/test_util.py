@@ -1008,6 +1008,43 @@ class TestUtil:
         timeout = Timeout(5)
         assert timeout.total == 5
 
+    @patch("time.monotonic")
+    def test_timeout_with_total_caps_limits(self, time_monotonic: MagicMock) -> None:
+        """with_total() folds a deadline budget in without relaxing limits."""
+        # A smaller budget caps both connect and read.
+        timeout = Timeout(connect=5, read=5).with_total(2)
+        assert timeout.connect_timeout == 2
+        timeout = self._make_time_pass(
+            seconds=0, timeout=timeout, time_mock=time_monotonic
+        )
+        assert timeout.read_timeout == 2
+
+        # A larger budget never extends configured connect/read limits.
+        timeout = Timeout(connect=1, read=1).with_total(10)
+        assert timeout.connect_timeout == 1
+        timeout = self._make_time_pass(
+            seconds=0, timeout=timeout, time_mock=time_monotonic
+        )
+        assert timeout.read_timeout == 1
+
+        # Infinite per-operation limits are still bounded by the budget.
+        timeout = Timeout(connect=None, read=None).with_total(3)
+        assert timeout.connect_timeout == 3
+        timeout = self._make_time_pass(
+            seconds=0, timeout=timeout, time_mock=time_monotonic
+        )
+        assert timeout.read_timeout == 3
+
+        # An existing total and the new one combine into the minimum.
+        assert Timeout(total=4).with_total(9).total == 4
+        assert Timeout(total=4).with_total(2).total == 2
+
+        # Default-token connect/read settings are preserved.
+        timeout = Timeout().with_total(2)
+        assert timeout._connect is _DEFAULT_TIMEOUT
+        assert timeout._read is _DEFAULT_TIMEOUT
+        assert timeout.total == 2
+
     def test_timeout_default_resolve(self) -> None:
         """The timeout default is resolved when read_timeout is accessed."""
         timeout = Timeout()

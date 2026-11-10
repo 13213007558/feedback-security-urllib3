@@ -8,14 +8,43 @@ import pytest
 
 from urllib3.exceptions import (
     ConnectTimeoutError,
+    DeadlineExceededError,
     InvalidHeader,
     MaxRetryError,
+    NewConnectionError,
     ReadTimeoutError,
     ResponseError,
     SSLError,
 )
+from urllib3.connection import HTTPConnection
+from urllib3.connectionpool import HTTPConnectionPool
 from urllib3.response import HTTPResponse
+from urllib3.util import retry as retry_module
+from urllib3.util import timeout as timeout_module
 from urllib3.util.retry import RequestHistory, Retry
+from urllib3.util.timeout import Timeout
+
+
+class FakeClock:
+    """Controllable replacement for the monotonic clock and sleep.
+
+    Drives both monotonic clocks used by the retry budget and the per-attempt
+    timeout, and records every sleep so waits can be asserted on deterministically.
+    """
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.advance(seconds)
 
 
 class TestRetry:
@@ -493,3 +522,346 @@ class TestRetry:
                 sleep_mock.assert_called_with(sleep_duration)
             else:
                 sleep_mock.assert_not_called()
+
+    def test_deadline_defaults_to_none(self) -> None:
+        """Without a deadline, behavior is unchanged and no clock is started."""
+        retry = Retry()
+        assert retry.deadline is None
+        assert retry._deadline_start is None
+        assert retry.remaining() is None
+        assert not retry.is_deadline_exceeded()
+        retry.raise_for_deadline()  # must not raise
+
+    @pytest.mark.parametrize("bad_value", [0, -1, -0.5, True, False, "2", 2j])
+    def test_deadline_validation(self, bad_value: object) -> None:
+        with pytest.raises(ValueError):
+            Retry(deadline=bad_value)  # type: ignore[arg-type]
+
+    def test_deadline_uses_monotonic_clock_and_counts_down(self) -> None:
+        clock = FakeClock()
+        with (
+            mock.patch.object(
+                retry_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch.object(retry_module.time, "sleep", side_effect=clock.sleep),
+        ):
+            retry = Retry(total=10, deadline=2.0)
+            assert retry.remaining() == 2.0  # clock starts on first use
+            clock.advance(0.75)
+            assert retry.remaining() == 1.25
+            clock.advance(2.0)
+            assert retry.remaining() == 0.0  # never negative
+            assert retry.is_deadline_exceeded()
+
+    def test_deadline_new_does_not_reset_start(self) -> None:
+        """Retry.new() and increment() must share one continuous budget."""
+        clock = FakeClock()
+        with mock.patch.object(
+            retry_module.time, "monotonic", side_effect=clock.monotonic
+        ):
+            retry = Retry(total=10, deadline=2.0)
+            retry.remaining()  # start the clock
+            clock.advance(1.5)
+
+            clone = retry.new()
+            assert clone.deadline == 2.0
+            assert clone._deadline_start == retry._deadline_start
+            assert clone.remaining() == 0.5
+
+            incremented = retry.increment(method="GET")
+            assert incremented._deadline_start == retry._deadline_start
+            assert incremented.remaining() == 0.5
+
+    def test_deadline_raise_for_deadline_keeps_reason_and_history(self) -> None:
+        clock = FakeClock()
+        error = ConnectTimeoutError("conntimeout")
+        with mock.patch.object(
+            retry_module.time, "monotonic", side_effect=clock.monotonic
+        ):
+            retry = Retry(total=10, deadline=2.0)
+            retry.remaining()
+            retry = retry.increment(method="GET", url="/a", error=error)
+            clock.advance(2.0)
+
+            with pytest.raises(DeadlineExceededError) as exc_info:
+                retry.raise_for_deadline(pool=DUMMY_POOL, url="/a", reason=error)
+
+            raised = exc_info.value
+            assert isinstance(raised, MaxRetryError)
+            assert raised.reason is error
+            assert raised.history == retry.history
+            assert raised.history[-1].error is error
+
+    def test_deadline_raise_without_reason_uses_timeout_error(self) -> None:
+        from urllib3.exceptions import TimeoutError as Urllib3TimeoutError
+
+        clock = FakeClock()
+        with mock.patch.object(
+            retry_module.time, "monotonic", side_effect=clock.monotonic
+        ):
+            retry = Retry(deadline=1.0)
+            retry.remaining()
+            clock.advance(1.0)
+            with pytest.raises(DeadlineExceededError) as exc_info:
+                retry.raise_for_deadline()
+            assert isinstance(exc_info.value.reason, Urllib3TimeoutError)
+            assert exc_info.value.history == ()
+
+    def test_deadline_increment_raises_with_full_history(self) -> None:
+        clock = FakeClock()
+        error = ConnectTimeoutError("boom")
+        with mock.patch.object(
+            retry_module.time, "monotonic", side_effect=clock.monotonic
+        ):
+            retry = Retry(connect=10, total=10, deadline=1.0)
+            retry.remaining()
+            retry = retry.increment(method="GET", url="/a", error=error)
+            clock.advance(1.0)
+
+            with pytest.raises(DeadlineExceededError) as exc_info:
+                retry.increment(method="GET", url="/a", error=error, _pool=DUMMY_POOL)
+
+            raised = exc_info.value
+            assert raised.reason is error
+            # Both attempts, including the failing one that exhausted the budget.
+            assert len(raised.history) == 2
+            assert all(item.error is error for item in raised.history)
+
+    def test_deadline_sleep_is_clipped_to_remaining_budget(self) -> None:
+        clock = FakeClock()
+        with (
+            mock.patch.object(
+                retry_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch.object(retry_module.time, "sleep", side_effect=clock.sleep),
+        ):
+            retry = Retry(total=10, deadline=2.0)
+            retry.remaining()
+            clock.advance(1.5)  # 0.5 left
+
+            retry._sleep(3.0)  # wants 3s, must be shortened to 0.5s
+            assert clock.sleeps == [0.5]
+            assert retry.is_deadline_exceeded()
+
+    def test_deadline_retry_after_sleep_is_clipped(self) -> None:
+        clock = FakeClock()
+        with (
+            mock.patch.object(
+                retry_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch.object(retry_module.time, "sleep", side_effect=clock.sleep),
+        ):
+            retry = Retry(deadline=2.0)
+            retry.remaining()
+            clock.advance(1.75)  # 0.25 left
+            response = HTTPResponse(
+                status=503, headers={"Retry-After": "10"}
+            )
+            assert retry.sleep_for_retry(response) is True
+            assert clock.sleeps == [0.25]
+            assert retry.is_deadline_exceeded()
+
+    def test_deadline_does_not_change_sleep_without_budget(self) -> None:
+        clock = FakeClock()
+        with (
+            mock.patch.object(
+                retry_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch.object(retry_module.time, "sleep", side_effect=clock.sleep),
+        ):
+            retry = Retry()
+            retry._sleep(1.5)
+            assert clock.sleeps == [1.5]
+
+    def test_deadline_error_is_picklable_with_history(self) -> None:
+        import pickle
+
+        history = (RequestHistory("GET", "/x", None, 503, None),)
+        error = DeadlineExceededError(
+            DUMMY_POOL, "/x", RuntimeError("boom"), history
+        )
+        restored = pickle.loads(pickle.dumps(error))
+        assert isinstance(restored, DeadlineExceededError)
+        assert isinstance(restored, MaxRetryError)
+        assert restored.url == "/x"
+        assert isinstance(restored.reason, RuntimeError)
+        assert restored.history == history
+
+
+class _RecordingConnectionPool(HTTPConnectionPool):
+    """A pool whose sends follow a scripted 503 / redirect / failure sequence."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self.sends: list[tuple[float, str]] = []
+        self.connection_error = NewConnectionError(
+            HTTPConnection("localhost"), "connection refused"
+        )
+        self.script: list[HTTPResponse | Exception] = [
+            HTTPResponse(status=503, headers={"Retry-After": "1"}),
+            HTTPResponse(status=302, headers={"location": "/elsewhere"}),
+            self.connection_error,
+            self.connection_error,
+            HTTPResponse(status=200),
+        ]
+
+    def _make_request(
+        self,
+        conn: HTTPConnection,
+        method: str,
+        url: str,
+        *args: object,
+        timeout: Timeout,
+        **kwargs: object,
+    ) -> HTTPResponse:
+        self.sends.append((self._clock.now, url))  # type: ignore[attr-defined]
+        outcome = self.script[len(self.sends) - 1]
+        # Every send (connection + request) consumes half a second of budget.
+        self._clock.advance(0.5)  # type: ignore[attr-defined]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class TestRetryDeadlineEndToEnd:
+    def test_deadline_stops_further_sends_across_full_sequence(self) -> None:
+        clock = FakeClock()
+        with (
+            mock.patch.object(
+                retry_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch.object(
+                timeout_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch.object(retry_module.time, "sleep", side_effect=clock.sleep),
+        ):
+            pool = _RecordingConnectionPool(host="localhost")
+            pool._clock = clock
+            retries = Retry(
+                total=10,
+                connect=10,
+                read=10,
+                redirect=10,
+                status=10,
+                deadline=3.0,
+                backoff_factor=0.5,
+            )
+
+            with pytest.raises(DeadlineExceededError) as exc_info:
+                pool.urlopen(
+                    "GET", "/a", retries=retries, assert_same_host=False
+                )
+
+        # 503 (with a Retry-After wait), a redirect and two connection
+        # failures were actually sent; the final 200 was never attempted.
+        assert len(pool.sends) == 4
+        assert [url for _, url in pool.sends] == [
+            "/a",
+            "/a",
+            "/elsewhere",
+            "/elsewhere",
+        ]
+        # The Retry-After sleep was honored but could not exceed the budget.
+        assert clock.sleeps == [1.0]
+
+        raised = exc_info.value
+        assert isinstance(raised, MaxRetryError)
+        # The last failure is preserved ...
+        assert raised.reason is pool.connection_error
+        # ... together with the history of every attempt.
+        assert len(raised.history) == 4
+        assert raised.history[0].status == 503
+        assert raised.history[1].status == 302
+        assert raised.history[1].redirect_location == "/elsewhere"
+        assert raised.history[2].error is pool.connection_error
+        assert raised.history[3].error is pool.connection_error
+
+    def test_deadline_pre_send_check_blocks_even_first_send(self) -> None:
+        clock = FakeClock()
+        with (
+            mock.patch.object(
+                retry_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch.object(
+                timeout_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+        ):
+            pool = _RecordingConnectionPool(host="localhost")
+            pool._clock = clock
+            retries = Retry(deadline=1.0)
+            retries.remaining()  # start the clock before entering urlopen
+            clock.advance(1.0)  # budget already gone
+
+            with pytest.raises(DeadlineExceededError) as exc_info:
+                pool.urlopen("GET", "/a", retries=retries)
+
+        assert pool.sends == []
+        assert exc_info.value.pool is pool
+        assert exc_info.value.url == "/a"
+
+    def test_no_deadline_keeps_historical_retry_behavior(self) -> None:
+        clock = FakeClock()
+        with (
+            mock.patch.object(
+                retry_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch.object(
+                timeout_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch.object(retry_module.time, "sleep", side_effect=clock.sleep),
+        ):
+            pool = _RecordingConnectionPool(host="localhost")
+            pool._clock = clock
+            # Plenty of retry counts, no deadline: the whole script runs and
+            # the final 200 response is returned.
+            retries = Retry(
+                total=10, connect=10, read=10, redirect=10, status=10
+            )
+            response = pool.urlopen(
+                "GET", "/a", retries=retries, assert_same_host=False
+            )
+
+        assert response.status == 200
+        assert len(pool.sends) == 5
+
+    def test_deadline_folds_remaining_budget_into_attempt_timeout(self) -> None:
+        clock = FakeClock()
+        seen_timeouts: list[Timeout] = []
+        with (
+            mock.patch.object(
+                retry_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+            mock.patch.object(
+                timeout_module.time, "monotonic", side_effect=clock.monotonic
+            ),
+        ):
+            pool = HTTPConnectionPool(host="localhost")
+            retries = Retry(deadline=2.0, connect=10, read=10)
+
+            def fake_make_request(
+                conn: HTTPConnection,
+                method: str,
+                url: str,
+                *args: object,
+                timeout: Timeout,
+                **kwargs: object,
+            ) -> HTTPResponse:
+                seen_timeouts.append(timeout)
+                return HTTPResponse(status=200)
+
+            with mock.patch.object(
+                pool, "_make_request", side_effect=fake_make_request
+            ):
+                pool.urlopen(
+                    "GET",
+                    "/",
+                    retries=retries,
+                    timeout=Timeout(connect=5.0, read=5.0),
+                )
+
+        assert len(seen_timeouts) == 1
+        attempt_timeout = seen_timeouts[0]
+        # The configured connect limit (5s) is shortened by the budget (2s),
+        # never relaxed.
+        assert attempt_timeout.connect_timeout == 2.0
+        assert attempt_timeout.total == 2.0

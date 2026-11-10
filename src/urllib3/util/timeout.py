@@ -199,6 +199,20 @@ class Timeout:
         # detect the user default.
         return Timeout(connect=self._connect, read=self._read, total=self.total)
 
+    def with_total(self, total: float) -> Timeout:
+        """Return a copy capped by an overall ``total`` budget.
+
+        The existing connect and read limits are kept and the new total is
+        applied on top of them. Because :attr:`connect_timeout` and
+        :attr:`read_timeout` take the minimum of the per-operation limit and
+        the total, passing a smaller ``total`` can only shorten timeouts,
+        never relax them. A larger ``total`` likewise cannot extend an
+        explicitly configured per-operation limit.
+        """
+        if self.total is not None and self.total is not _DEFAULT_TIMEOUT:
+            total = min(total, self.total)
+        return Timeout(connect=self._connect, read=self._read, total=total)
+
     def start_connect(self) -> float:
         """Start the timeout clock, used during a connect() attempt
 

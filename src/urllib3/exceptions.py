@@ -10,7 +10,7 @@ if typing.TYPE_CHECKING:
     from .connection import HTTPConnection
     from .connectionpool import ConnectionPool
     from .response import HTTPResponse
-    from .util.retry import Retry
+    from .util.retry import RequestHistory, Retry
 
 # Base Exceptions
 
@@ -104,6 +104,38 @@ class MaxRetryError(RequestError):
     def __reduce__(self) -> _TYPE_REDUCE_RESULT:
         # For pickling purposes.
         return self.__class__, (None, self.url, self.reason)
+
+
+class DeadlineExceededError(MaxRetryError):
+    """Raised when a request's total deadline is exhausted.
+
+    This is a :class:`MaxRetryError`, so existing ``except MaxRetryError``
+    handlers keep working, but it carries the :class:`~urllib3.util.retry.Retry`
+    history of every attempt that happened before the deadline ran out.
+
+    :param pool: The connection pool
+    :type pool: :class:`~urllib3.connectionpool.ConnectionPool`
+    :param str url: The requested Url
+    :param reason: The underlying error, if the last attempt raised one
+    :type reason: :class:`Exception`
+    :param history: The :class:`~urllib3.util.retry.RequestHistory` entries
+        accumulated across the attempts
+    :type history: tuple
+    """
+
+    def __init__(
+        self,
+        pool: ConnectionPool,
+        url: str | None,
+        reason: Exception | None = None,
+        history: tuple[RequestHistory, ...] = (),
+    ) -> None:
+        super().__init__(pool, url, reason)
+        self.history: tuple[RequestHistory, ...] = history
+
+    def __reduce__(self) -> _TYPE_REDUCE_RESULT:
+        # For pickling purposes.
+        return self.__class__, (None, self.url, self.reason, self.history)
 
 
 class HostChangedError(RequestError):

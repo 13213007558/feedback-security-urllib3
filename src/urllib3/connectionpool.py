@@ -756,7 +756,17 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         # for future rewinds in the event of a redirect/retry.
         body_pos = set_file_position(body, body_pos)
 
-        timeout_obj = self._get_timeout(timeout)
+        # Check the total deadline before starting another attempt and fold the
+        # remaining budget into the per-attempt timeout. The check happens
+        # before acquiring a connection or sending, so an exhausted budget
+        # never triggers another request; with_total() only ever shortens the
+        # configured connect/read timeouts, never relaxes them.
+        remaining = retries.remaining()
+        if remaining is not None:
+            retries.raise_for_deadline(pool=self, url=url)
+            timeout_obj = self._get_timeout(timeout).with_total(remaining)
+        else:
+            timeout_obj = self._get_timeout(timeout)
         try:
             # Request a connection from the queue.
             conn = self._get_conn(timeout=pool_timeout)

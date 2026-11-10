@@ -676,6 +676,59 @@ most transient errors resolve immediately. For example, a ``backoff_factor`` of
 Adding ``backoff_jitter`` introduces random variance to avoid the "thundering
 herd" problem where many clients retry in lockstep against a server.
 
+Setting a Total Deadline
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Retry counts and ``Retry-After``/backoff waits do not bound how long a single
+call can take: a service that gives one external call a two-second budget can
+still spend much longer than that across many retries. The ``deadline``
+parameter adds an optional total time budget, in seconds, that is shared by
+every attempt of a single call.
+
+.. code-block:: python
+
+    import urllib3
+    from urllib3.exceptions import DeadlineExceededError
+
+    retries = urllib3.Retry(total=5, deadline=2.0)
+    http = urllib3.PoolManager(retries=retries)
+
+    try:
+        http.request("GET", "https://example.com/")
+    except DeadlineExceededError as e:
+        print("gave up after 2s; last failure:", e.reason)
+        print("attempts:", e.history)
+
+The budget is measured with a monotonic clock and covers connection attempts,
+``Retry-After`` and backoff waiting, and redirects. The clock starts on first
+use and is never restarted, so the clones produced internally while retrying
+all draw from the same remaining time. Before each wait and each send urllib3
+checks the remaining budget; once it is exhausted no further request is sent
+and :class:`~urllib3.exceptions.DeadlineExceededError` (a subclass of
+:class:`~urllib3.exceptions.MaxRetryError`) is raised, carrying the last
+failure in ``reason`` and every attempt in ``history``.
+
+The remaining budget is also folded into each attempt's connect/read timeout
+by taking the shorter of the two, so a deadline can only make individual
+attempts time out sooner, never relax the timeouts you configured. Waits that
+would exceed the remaining budget are shortened rather than interrupted.
+
+Two boundaries are intentionally not enforced. The deadline does not
+forcibly cancel an in-flight user callback or a socket operation that has
+already started; it prevents the *next* wait or send. It also does not manage
+a response body that has been handed back to the caller (for example with
+``preload_content=False``): the budget governs the work up to the point
+:meth:`~urllib3.connectionpool.HTTPConnectionPool.urlopen` returns a response
+or raises, after which reading the stream is the caller's responsibility.
+
+When driving :class:`~urllib3.util.retry.Retry` manually rather than through a
+pool, treat one configured ``deadline`` as belonging to one logical call: keep
+using the object returned by :meth:`~urllib3.util.retry.Retry.increment`
+(constructing a fresh ``Retry`` would start a new clock) and call
+:meth:`~urllib3.util.retry.Retry.remaining` or
+:meth:`~urllib3.util.retry.Retry.raise_for_deadline` before every wait and
+every send. With ``deadline=None`` (the default) all behavior is unchanged.
+
 Errors & Exceptions
 -------------------
 

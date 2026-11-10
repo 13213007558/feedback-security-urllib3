@@ -14,6 +14,7 @@ from types import TracebackType
 
 from ..exceptions import (
     ConnectTimeoutError,
+    DeadlineExceededError,
     InvalidHeader,
     MaxRetryError,
     ProtocolError,
@@ -21,6 +22,7 @@ from ..exceptions import (
     ReadTimeoutError,
     ResponseError,
 )
+from ..exceptions import TimeoutError as RequestTimeoutError
 from .util import reraise
 
 if typing.TYPE_CHECKING:
@@ -196,6 +198,19 @@ class Retry:
         Retry-After headers. Defaults to :attr:`Retry.DEFAULT_RETRY_AFTER_MAX`.
         Any Retry-After headers larger than this value will be limited to this
         value.
+
+    :param float deadline:
+        Optional total time budget, in seconds, shared by every attempt of a
+        single call (connection attempts, backoff/``Retry-After`` waits and
+        redirects included). The clock starts on first use and is measured
+        with a monotonic clock; :meth:`new` never restarts it. When the budget
+        is exhausted, a :class:`~urllib3.exceptions.DeadlineExceededError` is
+        raised before any further wait or send, carrying the last failure and
+        the retry history. The remaining budget is also combined with the
+        per-attempt connect/read timeouts, always taking the shorter value, so
+        it can never relax those limits. Defaults to ``None``, which leaves
+        the historical behavior unchanged. See :meth:`remaining` for the
+        usage contract when driving :class:`Retry` manually.
     """
 
     #: Default methods to be used for ``allowed_methods``
@@ -243,12 +258,31 @@ class Retry:
         ] = DEFAULT_REMOVE_HEADERS_ON_REDIRECT,
         backoff_jitter: float = 0.0,
         retry_after_max: int = DEFAULT_RETRY_AFTER_MAX,
+        deadline: float | None = None,
     ) -> None:
         self.total = total
         self.connect = connect
         self.read = read
         self.status = status
         self.other = other
+
+        if deadline is not None:
+            if isinstance(deadline, bool) or not isinstance(
+                deadline, (int, float)
+            ):
+                raise ValueError(
+                    "Retry deadline must be an int, float or None, "
+                    f"not {type(deadline).__name__}."
+                )
+            if deadline <= 0:
+                raise ValueError(
+                    f"Retry deadline must be greater than zero, got {deadline!r}."
+                )
+        self.deadline = float(deadline) if deadline is not None else None
+        # Monotonic timestamp at which the budget started. It is lazily set on
+        # the first call to remaining() and is copied verbatim by new(), so
+        # clones produced during retries share one continuous budget.
+        self._deadline_start: float | None = None
 
         if redirect is False or total is False:
             redirect = 0
@@ -297,10 +331,15 @@ class Retry:
             remove_headers_on_redirect=self.remove_headers_on_redirect,
             respect_retry_after_header=self.respect_retry_after_header,
             backoff_jitter=self.backoff_jitter,
+            deadline=self.deadline,
         )
 
         params.update(kw)
-        return type(self)(**params)  # type: ignore[arg-type]
+        new_retry = type(self)(**params)  # type: ignore[arg-type]
+        # Preserve the original start of the clock. Retry.new() must never
+        # reset the deadline, otherwise each retry would get a fresh budget.
+        new_retry._deadline_start = self._deadline_start
+        return new_retry
 
     @classmethod
     def from_int(
@@ -377,10 +416,52 @@ class Retry:
 
         return self.parse_retry_after(retry_after)
 
+    def remaining(self) -> float | None:
+        """Seconds left in the total deadline, or ``None`` if none is set.
+
+        The deadline clock starts on the first call to this method and is
+        shared by all the :class:`Retry` clones produced by :meth:`new` and
+        :meth:`increment`. Callers driving a :class:`Retry` object manually
+        must therefore keep using the object returned by :meth:`increment`
+        instead of constructing a fresh one, and should check :meth:`remaining`
+        (or :meth:`raise_for_deadline`) before every wait and every send.
+        """
+        if self.deadline is None:
+            return None
+        if self._deadline_start is None:
+            self._deadline_start = time.monotonic()
+        return max(0.0, self.deadline - (time.monotonic() - self._deadline_start))
+
+    def is_deadline_exceeded(self) -> bool:
+        """Has the total deadline been used up?"""
+        remaining = self.remaining()
+        return remaining is not None and remaining <= 0.0
+
+    def raise_for_deadline(
+        self,
+        pool: ConnectionPool | None = None,
+        url: str | None = None,
+        reason: Exception | None = None,
+    ) -> None:
+        """Raise :class:`DeadlineExceededError` if no budget remains.
+
+        The exception keeps ``reason`` (the last failure, if any) and the full
+        retry :attr:`history`.
+        """
+        if not self.is_deadline_exceeded():
+            return
+        if reason is None:
+            reason = RequestTimeoutError(
+                f"Retry deadline of {self.deadline:g}s was exhausted."
+            )
+        raise DeadlineExceededError(
+            pool, url, reason, self.history
+        )  # type: ignore[arg-type]
+
     def sleep_for_retry(self, response: BaseHTTPResponse) -> bool:
         retry_after = self.get_retry_after(response)
         if retry_after:
-            time.sleep(retry_after)
+            self._sleep(retry_after)
             return True
 
         return False
@@ -389,7 +470,21 @@ class Retry:
         backoff = self.get_backoff_time()
         if backoff <= 0:
             return
-        time.sleep(backoff)
+        self._sleep(backoff)
+
+    def _sleep(self, duration: float) -> None:
+        """Sleep for at most ``duration`` seconds, clipped to the deadline.
+
+        Never raises :class:`DeadlineExceededError` itself: the caller is
+        responsible for checking the budget before the next send. If less time
+        than requested remains, the clipped sleep is consumed so the deadline
+        is visibly exhausted on the next check.
+        """
+        remaining = self.remaining()
+        if remaining is not None and duration > remaining:
+            duration = remaining
+        if duration > 0:
+            time.sleep(duration)
 
     def sleep(self, response: BaseHTTPResponse | None = None) -> None:
         """Sleep between retry attempts.
@@ -398,6 +493,11 @@ class Retry:
         and sleep the duration of the time requested. If that is not present, it
         will use an exponential backoff. By default, the backoff factor is 0 and
         this method will return immediately.
+
+        When a ``deadline`` is configured, neither the ``Retry-After`` wait nor
+        the backoff wait can exceed the remaining budget; the wait is shortened
+        instead and the next pre-send check raises
+        :class:`~urllib3.exceptions.DeadlineExceededError`.
         """
 
         if self.respect_retry_after_header and response:
@@ -558,6 +658,15 @@ class Retry:
             other=other,
             history=history,
         )
+
+        # Check the shared deadline before allowing another attempt. This runs
+        # after the history is built so the raised error records this attempt
+        # (including the last failure) alongside every previous attempt.
+        if new_retry.is_deadline_exceeded():
+            reason = error or ResponseError(cause)
+            raise DeadlineExceededError(  # type: ignore[arg-type]
+                _pool, url, reason, history
+            )
 
         if new_retry.is_exhausted():
             reason = error or ResponseError(cause)
