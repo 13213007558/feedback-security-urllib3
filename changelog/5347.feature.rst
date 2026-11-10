@@ -1,0 +1,6 @@
+Added :meth:`urllib3.PoolManager.retire_client_identity` to retire connection
+pools bound to a client identity (such as an mTLS client certificate) after
+certificate rotation. Retired pools stop lending connections immediately,
+in-flight requests complete normally but their connections are closed instead
+of being re-pooled, and subsequent requests create fresh connections from the
+updated client certificate configuration.

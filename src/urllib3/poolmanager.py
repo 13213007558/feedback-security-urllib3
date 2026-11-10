@@ -160,6 +160,18 @@ def _default_key_normalizer(
     return key_class(**context)
 
 
+def _normalize_host_for_pool_key(host: str) -> str:
+    """
+    Normalize a host the same way :func:`_default_key_normalizer` does, so a
+    user-provided host compares equal to the one stored in a pool key.
+    """
+    # Only the address portion of a scoped IPv6 host is case-insensitive.
+    address, separator, zone = host.partition("%")
+    if separator and ":" in address:
+        return f"{address.lower()}{separator}{zone}"
+    return host.lower()
+
+
 #: A dictionary that maps a scheme to a callable that creates a pool key.
 #: This can be used to alter the way pool keys are constructed, if desired.
 #: Each PoolManager makes a copy of this dictionary so they can be configured
@@ -299,6 +311,82 @@ class PoolManager(RequestMethods):
         re-used after completion.
         """
         self.pools.clear()
+
+    def retire_client_identity(
+        self,
+        *,
+        cert_file: str | None = None,
+        key_file: str | None = None,
+        key_password: str | None = None,
+        ssl_context: ssl.SSLContext | None = None,
+        host: str | None = None,
+    ) -> int:
+        """
+        Retire connection pools bound to a client identity, for example after
+        the client certificate used for mTLS has been rotated.
+
+        urllib3 does not watch certificate files for changes. When the caller
+        knows the client certificate has been rotated it should call this
+        method and update :attr:`connection_pool_kw` (or pass new
+        ``pool_kwargs``) so that subsequent requests use the new identity.
+
+        Pools matching all of the given identity fields are removed from the
+        manager and closed:
+
+        * Idle pooled connections are closed immediately.
+        * Connections currently checked out keep serving their in-flight
+          request, but are closed instead of being re-pooled when returned.
+        * Retired pools are disabled: even code still holding a reference to
+          a retired pool cannot check out connections with the revoked
+          identity (:class:`urllib3.exceptions.ClosedPoolError` is raised).
+
+        Pools for other hosts or other client identities are not affected.
+        New requests create fresh pools from the current configuration, so a
+        broken new configuration fails loudly instead of silently falling
+        back to the retired identity.
+
+        :param cert_file: Path of the retired client certificate.
+        :param key_file: Path of the retired client certificate key.
+        :param key_password: Password of the retired client certificate key.
+        :param ssl_context: The retired ``ssl.SSLContext`` object.
+        :param host: Limit retirement to pools for this host. If not given,
+            pools bound to the identity are retired across all hosts.
+        :return: The number of pools that were retired.
+        """
+        matchers = {
+            "key_cert_file": cert_file,
+            "key_key_file": key_file,
+            "key_key_password": key_password,
+            "key_ssl_context": ssl_context,
+        }
+        matchers = {
+            field: value for field, value in matchers.items() if value is not None
+        }
+        if host is not None:
+            matchers["key_host"] = _normalize_host_for_pool_key(host)
+        if not matchers:
+            raise ValueError(
+                "retire_client_identity() requires at least one of 'cert_file', "
+                "'key_file', 'key_password', 'ssl_context' or 'host'"
+            )
+
+        retired_pools: list[HTTPConnectionPool] = []
+        with self.pools.lock:
+            for pool_key in list(self.pools.keys()):
+                if all(
+                    getattr(pool_key, field, None) == value
+                    for field, value in matchers.items()
+                ):
+                    retired_pools.append(self.pools[pool_key])
+                    del self.pools[pool_key]
+
+        # Close pools outside the lock: closing sockets may block and
+        # 'close()' is safe to call while requests are in flight. In-flight
+        # connections are closed by '_put_conn' when they are returned.
+        for pool in retired_pools:
+            pool.close()
+
+        return len(retired_pools)
 
     def connection_from_host(
         self,

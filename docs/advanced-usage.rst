@@ -497,6 +497,53 @@ the ``key_password`` parameter to specify a password to decrypt the key.
 
 If your key isn't encrypted the ``key_password`` parameter isn't required.
 
+.. _rotating_client_certificates:
+
+Rotating client certificates
+----------------------------
+
+urllib3 does not watch certificate files for changes, so after your client
+certificate is rotated you need to tell the
+:class:`~urllib3.PoolManager` to retire the pools bound to the old identity
+and to use the new certificate for subsequent requests:
+
+.. code-block:: python
+
+    import urllib3
+
+    http = urllib3.PoolManager(
+        cert_file="/path/to/client-v1.pem",
+        key_file="/path/to/client-v1.key",
+        cert_reqs="CERT_REQUIRED",
+        ca_certs="/path/to/your/certificate_bundle",
+    )
+    resp = http.request("GET", "https://api.example.com/")
+
+    # The CA issued client-v2; rotate explicitly, then switch configuration.
+    http.retire_client_identity(
+        cert_file="/path/to/client-v1.pem",
+        key_file="/path/to/client-v1.key",
+    )
+    http.connection_pool_kw["cert_file"] = "/path/to/client-v2.pem"
+    http.connection_pool_kw["key_file"] = "/path/to/client-v2.key"
+
+    # New requests are made with the new client certificate.
+    resp = http.request("GET", "https://api.example.com/")
+
+Requests that were already in flight when
+:meth:`~urllib3.PoolManager.retire_client_identity` was called are allowed to
+complete: interrupting a healthy request would lose work, and its TLS session
+was already authenticated with the old certificate. However, when such a
+connection is returned it is closed instead of being re-pooled, and the
+retired pool is disabled, so even code still holding a reference to the old
+pool object cannot check out connections with the revoked identity.
+
+Because retired pools are removed from the manager, every subsequent request
+creates fresh connections from the current configuration. This means a broken
+new configuration fails loudly instead of silently falling back to the
+retired identity. Pools for other hosts or other client identities are not
+affected; pass ``host=`` to limit retirement to a single host.
+
 TLS minimum and maximum versions
 --------------------------------
 
