@@ -38,10 +38,13 @@ from .exceptions import (
     IncompleteRead,
     InvalidChunkLength,
     InvalidHeader,
+    InvalidTrailer,
     ProtocolError,
     ReadTimeoutError,
     ResponseNotChunked,
     SSLError,
+    TrailerLimitExceeded,
+    TrailersNotReady,
 )
 from .util.response import is_fp_closed, is_response_to_head
 from .util.retry import Retry
@@ -58,6 +61,10 @@ _READ_CHUNK_SIZE = 2**16
 # int() is more permissive, so we match against the grammar before calling it.
 _CONTENT_LENGTH_RE = re.compile(r"[0-9]+")
 _CHUNK_SIZE_RE = re.compile(rb"[0-9A-Fa-f]+")
+# Trailer field names use the RFC 9110 token grammar; field values reject
+# bare CR/LF that is not part of obs-fold whitespace.
+_TRAILER_NAME_RE = re.compile(rb"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_TRAILER_VALUE_RE = re.compile(rb"\n(?![ \t])|\r(?![ \t\n])")
 
 # Maximum length of a chunk-size line (and the trailing CRLF line) when reading a
 # chunked-transfer-encoded response. Matches ``http.client._MAXLINE`` so urllib3's
@@ -65,6 +72,49 @@ _CHUNK_SIZE_RE = re.compile(rb"[0-9A-Fa-f]+")
 # preventing a malicious server from forcing unbounded buffering (memory exhaustion)
 # via an unterminated chunk-size line.
 _MAX_CHUNK_LINE_LENGTH = 2**16
+
+# Default limits for the trailer section of an HTTP/1.1 chunked response. They
+# bound the amount of memory urllib3 will buffer while parsing trailers so a
+# malicious or broken peer cannot exhaust memory after the body is complete.
+DEFAULT_MAX_TRAILER_FIELDS = 100
+DEFAULT_MAX_TRAILER_BYTES = 64 * 1024
+
+# RFC 9110 section 6.5.3: fields that control framing, content metadata,
+# routing, request controls, authentication, response control data, or
+# connection-level parameters are forbidden in trailers because their
+# interpretation would change if received after the message body.
+_FORBIDDEN_TRAILER_FIELDS = frozenset(
+    {
+        "authentication-control",
+        "authorization",
+        "content-encoding",
+        "content-length",
+        "content-type",
+        "connection",
+        "cookie",
+        "cookie2",
+        "date",
+        "expect",
+        "forwarded",
+        "host",
+        "keep-alive",
+        "location",
+        "max-forwards",
+        "proxy-authenticate",
+        "proxy-authentication",
+        "proxy-authorization",
+        "proxy-connection",
+        "range",
+        "referer",
+        "set-cookie",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "via",
+        "www-authenticate",
+    }
+)
 
 
 class ContentDecoder:
@@ -531,6 +581,44 @@ class BaseHTTPResponse(io.IOBase):
         self._decoder_initialized = False
         self.length_remaining: int | None
 
+        # Trailer fields parsed after the chunked body. ``None`` means the
+        # trailer section has not been reached yet; an empty HTTPHeaderDict
+        # means the response ended without trailers (or has none).
+        self._trailer_fields: HTTPHeaderDict | None = None
+
+    @property
+    def trailers_available(self) -> bool:
+        """
+        Whether the trailer section has been fully read and parsed.
+
+        Returns ``False`` while the response body is still incomplete, in
+        which case :meth:`get_trailers` raises :class:`TrailersNotReady`.
+        A response that legitimately has no trailers reports ``True`` here
+        once the body is exhausted, so callers can distinguish "not ready
+        yet" from "no trailers".
+        """
+        return self._trailer_fields is not None
+
+    def get_trailers(self) -> HTTPHeaderDict:
+        """
+        Return the HTTP trailer fields received after the response body.
+
+        Trailer fields are stored separately from :attr:`headers` and keep
+        the same multi-value semantics as response headers: duplicate fields
+        are all retrievable through :meth:`HTTPHeaderDict.getlist`.
+
+        :raises TrailersNotReady: if the body has not been read to
+            completion, so it is not yet known whether trailers exist.
+        :raises InvalidTrailer: if the trailer section is malformed,
+            contains a forbidden field, or exceeds the configured limits.
+        """
+        if self._trailer_fields is None:
+            raise TrailersNotReady(
+                "Response trailers are not available until the body has "
+                "been fully read"
+            )
+        return self._trailer_fields
+
     def get_redirect_location(self) -> str | None | typing.Literal[False]:
         """
         Should we redirect and where to?
@@ -777,6 +865,8 @@ class HTTPResponse(BaseHTTPResponse):
         request_url: str | None = None,
         auto_close: bool = True,
         sock_shutdown: typing.Callable[[int], None] | None = None,
+        max_trailer_fields: int = DEFAULT_MAX_TRAILER_FIELDS,
+        max_trailer_bytes: int = DEFAULT_MAX_TRAILER_BYTES,
     ) -> None:
         super().__init__(
             headers=headers,
@@ -788,6 +878,13 @@ class HTTPResponse(BaseHTTPResponse):
             request_url=request_url,
             retries=retries,
         )
+
+        if max_trailer_fields < 0:
+            raise ValueError("max_trailer_fields must be greater than or equal to 0")
+        if max_trailer_bytes < 0:
+            raise ValueError("max_trailer_bytes must be greater than or equal to 0")
+        self.max_trailer_fields = max_trailer_fields
+        self.max_trailer_bytes = max_trailer_bytes
 
         self.enforce_content_length = enforce_content_length
         self.auto_close = auto_close
@@ -811,6 +908,10 @@ class HTTPResponse(BaseHTTPResponse):
 
         # Are we using the chunked-style of transfer encoding?
         self.chunk_left: int | None = None
+        # Raw size line that produced chunk_left == 0, retained so the
+        # terminating chunk can be validated for a complete CRLF before any
+        # trailer fields are parsed.
+        self._terminating_chunk_line: bytes | None = None
 
         # Determine length of response
         self.length_remaining = self._init_length(request_method)
@@ -1150,6 +1251,29 @@ class HTTPResponse(BaseHTTPResponse):
             if len(self._decoded_buffer) >= amt:
                 return self._decoded_buffer.get(amt)
 
+        if self.trailers_available:
+            # The chunked body (and its terminating chunk) has been fully
+            # consumed, so further reads return EOF without touching the
+            # underlying, by now closed, file pointer.
+            if len(self._decoded_buffer):
+                return self._decoded_buffer.get_all()
+            return b""
+
+        if (
+            amt is None
+            and self.chunked
+            and self.supports_chunked_reads()
+        ):
+            # Route unbounded reads of chunked responses through urllib3's own
+            # chunk parser so the trailer section is read and exposed via
+            # get_trailers() instead of being discarded by http.client.
+            data = b"".join(
+                self.read_chunked(decode_content=decode_content)
+            )
+            if cache_content and not self._uncached_read_occurred:
+                self._body = data
+            return data
+
         data = self._raw_read(amt)
         if not cache_content:
             self._uncached_read_occurred = True
@@ -1389,12 +1513,17 @@ class HTTPResponse(BaseHTTPResponse):
             raise ProtocolError(
                 "Response chunk size line exceeded maximum allowed length"
             ) from None
+        raw_line = line
         line = line.split(b";", 1)[0]
         try:
             chunk_size = line.rstrip()
             if not _CHUNK_SIZE_RE.fullmatch(chunk_size):
                 raise ValueError("invalid chunk size")
             self.chunk_left = int(chunk_size, 16)
+            if self.chunk_left == 0:
+                # Retain the unsplit line so the terminating chunk's CRLF can
+                # be checked strictly before the trailer section is parsed.
+                self._terminating_chunk_line = raw_line
         except ValueError:
             self.close()
             if line:
@@ -1425,6 +1554,151 @@ class HTTPResponse(BaseHTTPResponse):
             self._fp._safe_read(2)  # type: ignore[union-attr] # Toss the CRLF at the end of the chunk.
             self.chunk_left = None
         return returned_chunk  # type: ignore[no-any-return]
+
+    def _parse_trailer_line(self, line: bytes) -> tuple[str, str]:
+        """
+        Validate one ``field-line`` from a chunked trailer section and return
+        its decoded name and value. Raises :class:`InvalidTrailer` on any
+        grammar violation or forbidden field.
+        """
+        # RFC 9110 permits obs-fold whitespace in field values; strip the
+        # line ending before splitting name and value.
+        if line.endswith(b"\r\n"):
+            raw = line[:-2]
+        elif line.endswith(b"\n"):
+            raw = line[:-1]
+        else:
+            raw = line
+
+        name, separator, raw_value = raw.partition(b":")
+        if not separator or not _TRAILER_NAME_RE.fullmatch(name):
+            raise InvalidTrailer(f"Malformed trailer field line: {line!r}")
+
+        value = raw_value.strip(b" \t")
+        if _TRAILER_VALUE_RE.search(value):
+            raise InvalidTrailer(f"Malformed trailer field line: {line!r}")
+
+        field_name = name.decode("latin-1")
+        if field_name.lower() in _FORBIDDEN_TRAILER_FIELDS:
+            raise InvalidTrailer(
+                f"Field {field_name!r} is forbidden in response trailers"
+            )
+        return field_name, value.decode("latin-1")
+
+    def _validate_terminating_chunk_line(self, line: bytes) -> None:
+        """
+        Require a complete zero-length chunk size line (ending in a newline).
+        A stream cut off mid-line is truncation and must not reach the
+        trailer parser.
+        """
+        if len(line) > _MAX_CHUNK_LINE_LENGTH or not line.endswith(b"\n"):
+            self.close()
+            raise ProtocolError("Response ended prematurely") from None
+        size_part = line.split(b";", 1)[0].rstrip(b"\r\n")
+        if not _CHUNK_SIZE_RE.fullmatch(size_part) or int(size_part, 16) != 0:
+            self.close()
+            raise ProtocolError(
+                "Expected the final zero-length chunk before trailers"
+            ) from None
+        self.chunk_left = 0
+
+    def _drain_remaining_chunks(self) -> None:
+        """
+        Consume any data chunks still on the wire up to and including the
+        terminating zero-length chunk, then validate that terminating chunk
+        strictly. Used both when the main loop reaches the zero-length chunk
+        and when the decoder produced the whole body from buffered input while
+        chunk framing was never read. Raises :class:`ProtocolError` if the
+        stream ends before a complete zero-length chunk is seen.
+        """
+        # Finish a partially-consumed data chunk (a pre-set chunk_left whose
+        # payload is still on the wire). A pre-set zero is reset here because
+        # no terminating size line has actually been read from the wire yet.
+        if self.chunk_left is not None and self.chunk_left > 0:
+            self._fp._safe_read(self.chunk_left)  # type: ignore[union-attr]
+            self._fp._safe_read(2)  # type: ignore[union-attr] # Toss the CRLF at the end of the chunk.
+            self.chunk_left = None
+        elif self.chunk_left == 0 and self._terminating_chunk_line is None:
+            self.chunk_left = None
+
+        if self._terminating_chunk_line is None:
+            # The main loop never reached a size line (the decoder served the
+            # body from buffered input); read remaining chunks ourselves.
+            while True:
+                line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)  # type: ignore[union-attr]
+                if len(line) > _MAX_CHUNK_LINE_LENGTH:
+                    self.close()
+                    raise ProtocolError(
+                        "Response chunk size line exceeded maximum allowed length"
+                    ) from None
+                size_part = line.split(b";", 1)[0].rstrip(b"\r\n")
+                if not line.endswith(b"\n") or not _CHUNK_SIZE_RE.fullmatch(
+                    size_part
+                ):
+                    self.close()
+                    if line:
+                        raise InvalidChunkLength(self, line) from None
+                    raise ProtocolError("Response ended prematurely") from None
+                chunk_size = int(size_part, 16)
+                if chunk_size == 0:
+                    self._terminating_chunk_line = line
+                    break
+                self._fp._safe_read(chunk_size)  # type: ignore[union-attr]
+                self._fp._safe_read(2)  # type: ignore[union-attr] # Toss the CRLF at the end of the chunk.
+
+        line = self._terminating_chunk_line
+        self._terminating_chunk_line = None
+        self._validate_terminating_chunk_line(line)
+
+    def _read_trailers(self) -> HTTPHeaderDict:
+        """
+        Read and parse the trailer section following the final zero-length
+        chunk of an HTTP/1.1 chunked response.
+
+        Only assigns ``self._trailer_fields`` once the whole section has been
+        parsed successfully, so a truncated stream, early close, malformed
+        line, or exceeded limit never leaves apparently-complete trailers
+        behind.
+        """
+        trailers = HTTPHeaderDict()
+        trailer_bytes = 0
+        while self._fp is not None:
+            line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)  # type: ignore[union-attr]
+            if len(line) > _MAX_CHUNK_LINE_LENGTH:
+                self.close()
+                raise ProtocolError(
+                    "Response chunk trailer line exceeded maximum allowed length"
+                )
+            if not line:
+                if len(trailers) > 0:
+                    # The stream ended in the middle of the trailer section,
+                    # without the blank line that terminates it.
+                    self.close()
+                    raise ProtocolError(
+                        "Response ended prematurely while reading trailers"
+                    )
+                # Some sites close the connection right after the
+                # zero-length chunk without sending a terminating CRLF.
+                break
+            if line in (b"\r\n", b"\n"):
+                break
+
+            field_name, field_value = self._parse_trailer_line(line)
+            if len(trailers) >= self.max_trailer_fields:
+                raise TrailerLimitExceeded(
+                    f"Response trailers exceeded the maximum of "
+                    f"{self.max_trailer_fields} fields"
+                )
+            trailer_bytes += len(line)
+            if trailer_bytes > self.max_trailer_bytes:
+                raise TrailerLimitExceeded(
+                    f"Response trailers exceeded the maximum of "
+                    f"{self.max_trailer_bytes} bytes"
+                )
+            trailers.add(field_name, field_value)
+
+        self._trailer_fields = trailers
+        return trailers
 
     def read_chunked(
         self, amt: int | None = None, decode_content: bool | None = None
@@ -1478,9 +1752,13 @@ class HTTPResponse(BaseHTTPResponse):
                 if self._decoder and self._decoder.has_unconsumed_tail:
                     chunk = b""
                 else:
-                    self._update_chunk_length()
-                    self._uncached_read_occurred = True
+                    if self.chunk_left is None:
+                        self._update_chunk_length()
+                        self._uncached_read_occurred = True
                     if self.chunk_left == 0:
+                        # A zero-length chunk (possibly pre-set) ends the
+                        # body. Its size line is re-validated strictly in
+                        # _drain_remaining_chunks before trailers are read.
                         break
                     chunk = self._handle_chunk(amt)
                 decoded = self._decode(
@@ -1500,18 +1778,15 @@ class HTTPResponse(BaseHTTPResponse):
                 if decoded:  # Platform-specific: Jython.
                     yield decoded
 
-            # Chunk content ends with \r\n: discard it.
-            while self._fp is not None:
-                line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)
-                if len(line) > _MAX_CHUNK_LINE_LENGTH:
-                    raise ProtocolError(
-                        "Response chunk trailer line exceeded maximum allowed length"
-                    )
-                if not line:
-                    # Some sites may not end with '\r\n'.
-                    break
-                if line == b"\r\n":
-                    break
+            # Synchronize chunk framing and strictly validate the terminating
+            # zero-length chunk, regardless of whether the main loop reached
+            # it or a pre-set chunk_left short-circuited the framing.
+            self._drain_remaining_chunks()
+
+            # Parse the trailer section following the zero-length chunk. The
+            # fields are only published on the response if the whole section
+            # is read successfully.
+            self._read_trailers()
 
             # We read everything; close the "file".
             if self._original_response:

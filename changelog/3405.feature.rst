@@ -1,0 +1,6 @@
+Added support for reading HTTP/1.1 chunked response trailer fields via
+``HTTPResponse.trailers_available`` and ``HTTPResponse.get_trailers()``.
+Trailers are parsed separately from the initial headers, preserve
+duplicate-field multi-value semantics, reject fields that are forbidden in
+trailers, and are bounded by configurable ``max_trailer_fields`` and
+``max_trailer_bytes`` limits.

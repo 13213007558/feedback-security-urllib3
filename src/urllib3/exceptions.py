@@ -333,3 +333,31 @@ class HeaderParsingError(HTTPError):
 
 class UnrewindableBodyError(HTTPError):
     """urllib3 encountered an error when trying to rewind a body"""
+
+
+class TrailerError(HTTPError):
+    """Base class for errors while reading HTTP trailer fields."""
+
+
+class InvalidTrailer(TrailerError):
+    """
+    Raised when a trailer section is malformed or contains a field that is
+    forbidden in trailers (for instance one that controls message framing,
+    routing, or authentication).
+    """
+
+
+class TrailerLimitExceeded(TrailerError):
+    """
+    Raised when a trailer section exceeds the configured maximum number of
+    fields or maximum total size in bytes.
+    """
+
+
+class TrailersNotReady(TrailerError):
+    """
+    Raised when trailers are requested before the response body has been read
+    to completion. An empty trailer section is reported with an empty
+    :class:`~urllib3.HTTPHeaderDict`, so this error means "not ready yet",
+    never "no trailers were sent".
+    """

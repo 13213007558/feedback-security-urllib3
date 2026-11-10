@@ -165,6 +165,89 @@ You can use this file-like object to do things like decode the content using
 
     resp.release_conn()
 
+.. _http_trailers:
+
+HTTP Trailers
+-------------
+
+An HTTP/1.1 response sent with ``Transfer-Encoding: chunked`` may carry
+trailer fields after the body, in the section that follows the final
+zero-length chunk. urllib3 reads these fields while the body is being
+consumed and exposes them separately from the initial response
+:attr:`~response.HTTPResponse.headers`.
+
+Trailers are only available once the body has been read to completion.
+Check :attr:`~response.HTTPResponse.trailers_available` to distinguish
+"not ready yet" from "the response had no trailers":
+
+.. code-block:: python
+
+    import urllib3
+
+    resp = urllib3.request(
+        "GET",
+        "https://example.com/stream",
+        preload_content=False,
+    )
+    body = resp.read()
+
+    if not resp.trailers_available:
+        raise RuntimeError("the response body was not fully read")
+
+    trailers = resp.get_trailers()
+    print(trailers)
+    # HTTPHeaderDict({'checksum': 'deadbeef'})
+
+Calling :meth:`~response.HTTPResponse.get_trailers` before the body is
+complete raises :class:`~exceptions.TrailersNotReady`. The same result is
+seen regardless of whether the body is consumed with
+:meth:`~response.HTTPResponse.read`,
+:meth:`~response.HTTPResponse.stream`,
+:meth:`~response.HTTPResponse.read_chunked`, or preloaded through the
+``data`` property. Duplicate trailer fields keep the same multi-value
+semantics as headers and are retrievable with
+:meth:`~HTTPHeaderDict.getlist`.
+
+Fields that control message framing, routing, or authentication (for
+example ``Content-Length``, ``Host``, ``Authorization``, or
+``Transfer-Encoding``) are forbidden in trailers and cause an
+:class:`~exceptions.InvalidTrailer` error. A truncated stream, an early
+close, or an unparseable trailer line raises an error and never leaves
+apparently-complete trailers behind. The number of fields and their total
+size are bounded by ``max_trailer_fields`` and ``max_trailer_bytes``,
+which can be tuned when constructing an
+:class:`~response.HTTPResponse`; exceeding either raises
+:class:`~exceptions.TrailerLimitExceeded`.
+
+.. warning::
+
+    Reading a trailer field only proves that it was transported at the end
+    of the message; it does **not** mean that any checksum or signature it
+    carries is valid or trusted. After reading the full body, explicitly
+    check the fields your application recognizes before accepting the data.
+
+.. code-block:: python
+
+    import hashlib
+    import urllib3
+
+    resp = urllib3.request(
+        "GET",
+        "https://example.com/artifact",
+        preload_content=False,
+    )
+    body = resp.read()
+
+    trailers = resp.get_trailers()
+    received = trailers.get("checksum")
+    expected = hashlib.sha256(body).hexdigest()
+
+    if received is None or received != expected:
+        raise ValueError("checksum missing or did not match; rejecting body")
+
+    # The body is only accepted after an application-recognized field is
+    # independently verified.
+
 .. _upload_buffering:
 
 Upload Buffering

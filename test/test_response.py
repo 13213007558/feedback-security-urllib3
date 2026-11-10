@@ -16,17 +16,23 @@ from unittest import mock
 
 import pytest
 
+from urllib3._collections import HTTPHeaderDict
 from urllib3.exceptions import (
     BodyNotHttplibCompatible,
     DecodeError,
     IncompleteRead,
     InvalidChunkLength,
     InvalidHeader,
+    InvalidTrailer,
     ProtocolError,
     ResponseNotChunked,
     SSLError,
+    TrailerLimitExceeded,
+    TrailersNotReady,
 )
 from urllib3.response import (  # type: ignore[attr-defined]
+    DEFAULT_MAX_TRAILER_BYTES,
+    DEFAULT_MAX_TRAILER_FIELDS,
     _MAX_CHUNK_LINE_LENGTH,
     BaseHTTPResponse,
     BytesQueueBuffer,
@@ -246,9 +252,12 @@ class TestResponse:
         data = b"foo"
         initial_limit = 1
         if initial_read_method in ("read_chunked", "stream"):
-            httplib_r = httplib.HTTPResponse(MockSock)  # type: ignore[arg-type]
+            # Include the terminating zero-length chunk and blank line so
+            # the chunked framing is complete after the partial read.
+            fp = BytesIO(b"3\r\nfoo\r\n0\r\n\r\n")
+            httplib_r = httplib.HTTPResponse(MockSock, method="GET")  # type: ignore[arg-type]
             httplib_r.chunked = True
-            httplib_r.fp = MockChunkedEncodingResponse([data])  # type: ignore[assignment]
+            httplib_r.fp = fp  # type: ignore[assignment]
             r = HTTPResponse(
                 httplib_r,
                 preload_content=False,
@@ -2001,12 +2010,24 @@ class TestResponse:
                 match="Response chunk trailer line exceeded maximum allowed length",
             ):
                 next(chunks)
+        elif line_ending == b"":
+            # A trailer field line followed by EOF without the terminating
+            # blank line is truncation: the response must fail rather than
+            # expose apparently-complete trailers.
+            with pytest.raises(
+                ProtocolError, match="Response ended prematurely while reading trailers"
+            ):
+                next(chunks)
         else:
             assert list(chunks) == []
+            assert resp.trailers_available is True
+            assert resp.get_trailers()["X"] == "x" * (trailer_length - 4)
 
         assert fp.closed
         assert r.isclosed()
         assert resp.closed
+        if line_ending == b"" or trailer_length > _MAX_CHUNK_LINE_LENGTH:
+            assert resp.trailers_available is False
 
     def test_truncated_before_chunk(self) -> None:
         stream = [b"foooo", b"bbbbaaaaar"]
@@ -2203,6 +2224,362 @@ class TestResponse:
             resp = HTTPResponse(fp, status=204)
             resp.read(16)
         assert "Response may not contain content" in str(excinfo.value)
+
+
+class OneByteAtATimeIO:
+    """
+    File-like object whose ``readline`` advances through the buffered bytes
+    one byte at a time, forcing chunked size-line and trailer-line parsing to
+    reassemble lines from single bytes. ``read`` still honours the requested
+    amount, like a real socket's ``recv`` would for a fixed-size payload.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._pos = 0
+        self.closed = False
+
+    def read(self, amt: int = -1) -> bytes:
+        if self._pos >= len(self._data):
+            return b""
+        if amt is None or amt < 0:
+            amt = len(self._data) - self._pos
+        chunk = self._data[self._pos : self._pos + amt]
+        self._pos += len(chunk)
+        return chunk
+
+    def read1(self, amt: int = -1) -> bytes:
+        return self.read(amt)
+
+    def readline(self, amt: int | None = -1) -> bytes:
+        if self._pos >= len(self._data):
+            return b""
+        limit = len(self._data)
+        if amt and amt > 0:
+            limit = min(limit, self._pos + amt)
+        line = bytearray()
+        while self._pos < limit:
+            byte = self._data[self._pos : self._pos + 1]
+            self._pos += 1
+            line.extend(byte)
+            if byte == b"\n":
+                break
+        return bytes(line)
+
+    def close(self) -> None:
+        self.closed = True
+
+    def flush(self) -> None:
+        pass
+
+
+def _chunked_response(
+    wire: bytes,
+    *,
+    one_byte_at_a_time: bool = False,
+    **kwargs: typing.Any,
+) -> HTTPResponse:
+    fp: typing.Any
+    if one_byte_at_a_time:
+        fp = OneByteAtATimeIO(wire)
+    else:
+        fp = BytesIO(wire)
+    httplib_response = httplib.HTTPResponse(MockSock, method="GET")
+    httplib_response.fp = fp
+    httplib_response.chunked = True
+    kwargs.setdefault("preload_content", False)
+    kwargs.setdefault("headers", {"transfer-encoding": "chunked"})
+    kwargs.setdefault("original_response", httplib_response)
+    return HTTPResponse(httplib_response, **kwargs)
+
+
+class TestResponseTrailers:
+    def _body(self, response: HTTPResponse, method: str) -> bytes:
+        if method == "read":
+            return response.read()
+        if method == "stream":
+            return b"".join(response.stream())
+        if method == "read_chunked":
+            return b"".join(response.read_chunked())
+        raise AssertionError(method)
+
+    @pytest.mark.parametrize("one_byte_at_a_time", [False, True])
+    def test_empty_trailer_section(self, one_byte_at_a_time: bool) -> None:
+        response = _chunked_response(
+            b"5\r\nhello\r\n0\r\n\r\n",
+            one_byte_at_a_time=one_byte_at_a_time,
+        )
+        assert response.trailers_available is False
+        with pytest.raises(TrailersNotReady):
+            response.get_trailers()
+
+        assert response.read() == b"hello"
+        assert response.trailers_available is True
+        trailers = response.get_trailers()
+        assert trailers == {}
+        assert isinstance(trailers, HTTPHeaderDict)
+
+    @pytest.mark.parametrize("one_byte_at_a_time", [False, True])
+    def test_trailers_with_duplicate_fields(self, one_byte_at_a_time: bool) -> None:
+        wire = (
+            b"3\r\nfoo\r\n0\r\n"
+            b"checksum: abc\r\n"
+            b"x-note: one\r\n"
+            b"x-note: two\r\n\r\n"
+        )
+        response = _chunked_response(wire, one_byte_at_a_time=one_byte_at_a_time)
+        assert response.read() == b"foo"
+
+        trailers = response.get_trailers()
+        assert trailers["checksum"] == "abc"
+        assert trailers.getlist("x-note") == ["one", "two"]
+        assert trailers["x-note"] == "one, two"
+        # Trailers are kept separate from the initial response headers.
+        assert "checksum" not in response.headers
+        assert "x-note" not in response.headers
+
+    @pytest.mark.parametrize("method", ["read", "stream", "read_chunked"])
+    @pytest.mark.parametrize("one_byte_at_a_time", [False, True])
+    def test_consistent_across_read_paths(
+        self, method: str, one_byte_at_a_time: bool
+    ) -> None:
+        wire = b"3\r\nfoo\r\n3\r\nbar\r\n0\r\nchecksum: deadbeef\r\n\r\n"
+        response = _chunked_response(wire, one_byte_at_a_time=one_byte_at_a_time)
+
+        assert self._body(response, method) == b"foobar"
+        assert response.trailers_available is True
+        assert response.get_trailers()["checksum"] == "deadbeef"
+
+    def test_preloaded_body_exposes_trailers(self) -> None:
+        wire = b"3\r\nfoo\r\n0\r\nchecksum: abc\r\n\r\n"
+        fp = BytesIO(wire)
+        httplib_response = httplib.HTTPResponse(MockSock, method="GET")
+        httplib_response.fp = fp
+        response = HTTPResponse(
+            httplib_response,
+            preload_content=True,
+            headers={"transfer-encoding": "chunked"},
+            original_response=httplib_response,
+        )
+        assert response.data == b"foo"
+        assert response.trailers_available is True
+        assert response.get_trailers()["checksum"] == "abc"
+
+    @pytest.mark.parametrize("decode_content", [True, False])
+    def test_trailers_survive_gzipped_multichunk_body(
+        self, decode_content: bool
+    ) -> None:
+        body = b"the quick brown fox " * 50
+        compressor = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+        compressed = compressor.compress(body) + compressor.flush()
+        half = len(compressed) // 2
+        wire = (
+            f"{half:X}\r\n".encode()
+            + compressed[:half]
+            + b"\r\n"
+            + f"{len(compressed) - half:X}\r\n".encode()
+            + compressed[half:]
+            + b"\r\n0\r\nchecksum: abc123\r\n\r\n"
+        )
+        response = _chunked_response(
+            wire,
+            headers={"transfer-encoding": "chunked", "content-encoding": "gzip"},
+        )
+        data = response.read(decode_content=decode_content)
+        assert response.trailers_available is True
+        assert response.get_trailers()["checksum"] == "abc123"
+        if decode_content:
+            assert data == body
+        else:
+            assert data == compressed
+
+
+    @pytest.mark.parametrize("one_byte_at_a_time", [False, True])
+    def test_forbidden_trailer_fields_rejected(self, one_byte_at_a_time: bool) -> None:
+        forbidden = [
+            "content-length",
+            "transfer-encoding",
+            "host",
+            "authorization",
+            "proxy-authorization",
+            "set-cookie",
+            "www-authenticate",
+            "location",
+            "trailer",
+        ]
+        for field in forbidden:
+            wire = b"3\r\nfoo\r\n0\r\n" + field.encode() + b": x\r\n\r\n"
+            response = _chunked_response(wire, one_byte_at_a_time=one_byte_at_a_time)
+            with pytest.raises(InvalidTrailer, match="forbidden in response trailers"):
+                response.read()
+            assert response.trailers_available is False
+
+    @pytest.mark.parametrize("one_byte_at_a_time", [False, True])
+    def test_malformed_trailer_line_rejected(self, one_byte_at_a_time: bool) -> None:
+        for bad_line in (b"no-colon-here\r\n", b": value\r\n", b"bad name: v\r\n"):
+            wire = b"3\r\nfoo\r\n0\r\n" + bad_line + b"\r\n"
+            response = _chunked_response(wire, one_byte_at_a_time=one_byte_at_a_time)
+            with pytest.raises(InvalidTrailer, match="Malformed trailer field line"):
+                response.read()
+            assert response.trailers_available is False
+
+    def test_trailer_field_count_limit(self) -> None:
+        wire = b"3\r\nfoo\r\n0\r\n"
+        wire += b"".join(f"x-{i}: v\r\n".encode() for i in range(3))
+        wire += b"\r\n"
+        response = _chunked_response(wire, max_trailer_fields=2)
+        with pytest.raises(TrailerLimitExceeded, match="maximum of 2 fields"):
+            response.read()
+        assert response.trailers_available is False
+
+    def test_trailer_byte_limit(self) -> None:
+        field_line = b"x-a: 0123456789\r\n"
+        wire = b"3\r\nfoo\r\n0\r\n" + field_line + b"\r\n"
+        # A limit equal to the field-line length still accepts that line.
+        response = _chunked_response(wire, max_trailer_bytes=len(field_line))
+        response.read()
+        assert response.get_trailers()["x-a"] == "0123456789"
+        # One byte fewer trips the limit and must not publish trailers.
+        response = _chunked_response(
+            wire, max_trailer_bytes=len(field_line) - 1
+        )
+        with pytest.raises(TrailerLimitExceeded, match="maximum of"):
+            response.read()
+        assert response.trailers_available is False
+
+    def test_zero_limits_reject_any_trailer(self) -> None:
+        wire = b"3\r\nfoo\r\n0\r\nx-a: v\r\n\r\n"
+        response = _chunked_response(wire, max_trailer_fields=0)
+        with pytest.raises(TrailerLimitExceeded):
+            response.read()
+        assert response.trailers_available is False
+
+    def test_trailer_byte_limit_accumulates_across_fields(self) -> None:
+        first = b"x-a: 0123456789\r\n"
+        second = b"x-b: 0123456789\r\n"
+        wire = b"3\r\nfoo\r\n0\r\n" + first + second + b"\r\n"
+        # Enough for the first line but not the two lines combined.
+        response = _chunked_response(
+            wire, max_trailer_bytes=len(first) + len(second) - 1
+        )
+        with pytest.raises(TrailerLimitExceeded, match="maximum of"):
+            response.read()
+        assert response.trailers_available is False
+
+    def test_limit_constructor_validation(self) -> None:
+        with pytest.raises(ValueError, match="max_trailer_fields"):
+            HTTPResponse(max_trailer_fields=-1)
+        with pytest.raises(ValueError, match="max_trailer_bytes"):
+            HTTPResponse(max_trailer_bytes=-1)
+
+    def test_default_limits_exposed(self) -> None:
+        response = _chunked_response(b"3\r\nfoo\r\n0\r\n\r\n")
+        assert response.max_trailer_fields == DEFAULT_MAX_TRAILER_FIELDS
+        assert response.max_trailer_bytes == DEFAULT_MAX_TRAILER_BYTES
+
+    @pytest.mark.parametrize("one_byte_at_a_time", [False, True])
+    def test_truncated_after_zero_chunk_does_not_fake_trailers(
+        self, one_byte_at_a_time: bool
+    ) -> None:
+        # Trailer field line present but the terminating blank line never
+        # arrives because the connection drops: must fail, not publish
+        # apparently-complete trailers.
+        wire = b"3\r\nfoo\r\n0\r\nchecksum: abc\r\n"
+        response = _chunked_response(wire, one_byte_at_a_time=one_byte_at_a_time)
+        with pytest.raises(
+            ProtocolError, match="Response ended prematurely while reading trailers"
+        ):
+            response.read()
+        assert response.trailers_available is False
+        with pytest.raises(TrailersNotReady):
+            response.get_trailers()
+
+    @pytest.mark.parametrize("one_byte_at_a_time", [False, True])
+    def test_truncated_terminating_chunk_line_rejected(
+        self, one_byte_at_a_time: bool
+    ) -> None:
+        # The zero-length chunk's size line is cut off before its newline.
+        # This must be treated as truncation, never as a complete (empty)
+        # trailer section.
+        for wire in (b"3\r\nfoo\r\n0\r", b"3\r\nfoo\r\n0"):
+            response = _chunked_response(
+                wire, one_byte_at_a_time=one_byte_at_a_time
+            )
+            with pytest.raises(ProtocolError, match="Response ended prematurely"):
+                response.read()
+            assert response.trailers_available is False
+
+    def test_terminating_chunk_with_extension_accepted(self) -> None:
+        response = _chunked_response(b"3\r\nfoo\r\n0;name=value\r\nx: y\r\n\r\n")
+        assert response.read() == b"foo"
+        assert response.trailers_available is True
+        assert response.get_trailers()["x"] == "y"
+
+    @pytest.mark.parametrize("one_byte_at_a_time", [False, True])
+    def test_eof_without_terminator_after_empty_trailers_allowed(
+        self, one_byte_at_a_time: bool
+    ) -> None:
+        # Some servers close right after the zero-length chunk. An empty
+        # trailer section is reported as such rather than failing.
+        wire = b"3\r\nfoo\r\n0\r\n"
+        response = _chunked_response(wire, one_byte_at_a_time=one_byte_at_a_time)
+        assert response.read() == b"foo"
+        assert response.trailers_available is True
+        assert response.get_trailers() == {}
+
+    @pytest.mark.parametrize("one_byte_at_a_time", [False, True])
+    def test_truncated_within_body_does_not_fake_trailers(
+        self, one_byte_at_a_time: bool
+    ) -> None:
+        # The chunk promises 5 bytes but only 3 arrive before EOF.
+        wire = b"5\r\nfoo"
+        response = _chunked_response(wire, one_byte_at_a_time=one_byte_at_a_time)
+        with pytest.raises((ProtocolError, IncompleteRead)):
+            response.read()
+        assert response.trailers_available is False
+
+    @pytest.mark.parametrize("one_byte_at_a_time", [False, True])
+    def test_trailer_line_too_long(self, one_byte_at_a_time: bool) -> None:
+        trailer = b"x: " + b"a" * (_MAX_CHUNK_LINE_LENGTH + 10) + b"\r\n\r\n"
+        wire = b"3\r\nfoo\r\n0\r\n" + trailer
+        response = _chunked_response(wire, one_byte_at_a_time=one_byte_at_a_time)
+        with pytest.raises(
+            ProtocolError, match="Response chunk trailer line exceeded maximum"
+        ):
+            response.read()
+        assert response.trailers_available is False
+
+    def test_not_ready_state_before_body_is_consumed(self) -> None:
+        wire = b"5\r\nhello\r\n0\r\nchecksum: abc\r\n\r\n"
+        response = _chunked_response(wire)
+        assert response.trailers_available is False
+        # Keep the generator alive: letting it be garbage collected after a
+        # partial next() closes the connection via _error_catcher.
+        chunks = response.read_chunked(2)
+        assert next(chunks) == b"he"
+        assert response.trailers_available is False
+        with pytest.raises(TrailersNotReady):
+            response.get_trailers()
+        # Draining the rest of the body publishes the trailers.
+        assert b"".join(chunks) == b"llo"
+        assert response.trailers_available is True
+        assert response.get_trailers()["checksum"] == "abc"
+
+    def test_application_must_check_trailer_after_reading(self) -> None:
+        # Demonstrates the intended usage pattern: transport-level reading of
+        # a trailer field does not mean the checksum it carries is trusted.
+        # The application validates a field it recognizes before accepting
+        # the body.
+        wire = b"5\r\nhello\r\n0\r\nchecksum: mismatch\r\n\r\n"
+        response = _chunked_response(wire)
+        body = response.read()
+        assert response.trailers_available is True
+
+        expected = "deadbeef"
+        actual = response.get_trailers().get("checksum")
+        accepted = actual == expected
+        assert body == b"hello"
+        assert accepted is False
 
 
 class MockChunkedEncodingResponse:
